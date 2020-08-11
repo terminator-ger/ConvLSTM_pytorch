@@ -1,10 +1,14 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 import torch.nn as nn
+import torch.nn.functional as F
 import torch
 import pdb
 from strainDetector.ConvLSTM_pytorch.ConvLSTMCell import ConvLSTMCell
 
 
-class ConvLSTM(nn.Module):
+class AttentionConvLSTM(nn.Module):
 
     """
 
@@ -33,8 +37,8 @@ class ConvLSTM(nn.Module):
     """
 
     def __init__(self, input_dim, hidden_dim, kernel_size, num_layers,
-                 batch_first=False, bias=True, return_all_layers=False, static_features=0, config='ManyToMany'):
-        super(ConvLSTM, self).__init__()
+                 batch_first=False, bias=True, return_all_layers=False, static_features=0):
+        super(AttentionConvLSTM, self).__init__()
 
         #self._check_kernel_size_consistency(kernel_size)
 
@@ -44,7 +48,6 @@ class ConvLSTM(nn.Module):
         if not len(kernel_size) == len(hidden_dim) == num_layers:
             raise ValueError('Inconsistent list length.')
 
-        self.config = config
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.kernel_size = kernel_size
@@ -54,27 +57,38 @@ class ConvLSTM(nn.Module):
         self.static_features = static_features
         self.return_all_layers = return_all_layers
 
-        cell_list = []
-        #for i in range(0, self.num_layers):
-        i = 0
-        cur_input_dim = self.input_dim if i == 0 else self.hidden_dim[i - 1]
+        cell_list0 = []
+        cell_list1 = []
 
-        cell_list.append(ConvLSTMCell(input_dim=cur_input_dim,
-                                          hidden_dim=self.hidden_dim[i],
-                                          kernel_size=self.kernel_size[i],
-                                          bias=self.bias))
+        for i in range(0, self.num_layers):
+            cur_input_dim = self.input_dim if i == 0 else self.hidden_dim[i - 1]
 
-        cell_list.append(ConvLSTMCell(input_dim=cur_input_dim,
-                                          hidden_dim=self.hidden_dim[i],
-                                          kernel_size=self.kernel_size[i],
-                                          bias=self.bias))
+            cell_list0.append(ConvLSTMCell(input_dim=cur_input_dim,
+                                           hidden_dim=self.hidden_dim[i],
+                                           kernel_size=self.kernel_size[i],
+                                           bias=self.bias))
+
+            cell_list1.append(ConvLSTMCell(input_dim=self.hidden_dim[-1]+1,
+                                           hidden_dim=1,
+                                           kernel_size=self.kernel_size[i],
+                                           bias=self.bias,
+                                           init_hidden_dim=1))
+
+        self.encoder = nn.ModuleList(cell_list0)
+        self.decoder = nn.ModuleList(cell_list1)
 
 
-        self.cell_list = nn.ModuleList(cell_list)
-        if self.config == 'ManyToOne':
-            self.linear = nn.Linear(hidden_dim[0]*50 + self.static_features, 1)
-        else:
-            self.linear = nn.Linear(hidden_dim[0]*2 + self.static_features, 1)
+        self.attention_enc = nn.Linear(100,
+                                   100,
+                                   bias=True)
+
+        self.attention_dec = torch.nn.Linear(100,
+                                            100,
+                                            bias=True)
+
+        self.FC = torch.nn.Linear(2*100,
+                                  1,
+                                  bias=True)
 
 
     def forward(self, input_tensor, hidden_state=None):
@@ -103,93 +117,95 @@ class ConvLSTM(nn.Module):
             input_tensor, static_feat_tensor = torch.split(input_tensor,
                                                         [s-self.static_features, self.static_features], 
                                                         dim=-1)
-        B, T, _, s = input_tensor.size()
+        B, T, C, S = input_tensor.size()
 
         # Implement stateful ConvLSTM
         if hidden_state is not None:
             raise NotImplementedError()
         else:
             # Since the init is done in forward. Can send image size here
-            hidden_state = self._init_hidden(batch_size=B,
-                                             spatial_size=(s))
+            hidden_state_enc = self._init_hidden_encoder(batch_size=B,
+                                             spatial_size=(S))
+            hidden_state_dec = self._init_hidden_decoder(batch_size=B,
+                                             spatial_size=(S))
+
 
         layer_output_list = []
         last_state_list = []
 
         seq_len = input_tensor.size(1)
-        sp_len = input_tensor.size(3)
         cur_layer_input = input_tensor
 
-#        h, c = hidden_state[0]
-#        output_inner = []
-#        # temporal
-#        for t in range(seq_len):
-#            h, c = self.cell_list[0](input_tensor=cur_layer_input[:, t, :, :],
-#                                             cur_state=[h, c],
-#                                             time=t)
-#            output_inner.append(h)
-#
-#        layer_output_t= torch.stack(output_inner, dim=1)
+        for layer_idx in range(self.num_layers):
 
-        #reset states
-        h, c = hidden_state[1]
-        output_inner = []
-        cur_layer_input = input_tensor
-        #spatial
-        for s in range(sp_len):
-            #[b, t, c, s]
-            h, c = self.cell_list[1](input_tensor=cur_layer_input[:, :, :, s].permute(0,2,1),
-                                             cur_state=[h, c],
-                                             time=s)
+            h_e, c_e = hidden_state_enc[layer_idx]
+            h_d, c_d = hidden_state_dec[layer_idx]
 
-            #[b, s, c, t]
-            output_inner.append(h)
+            ones = torch.ones((B,1,S)).cuda()
+            h_d = torch.cat((h_d, ones), dim=1)
+            c_d = torch.cat((c_d, ones), dim=1)
 
-        layer_output_s = torch.stack(output_inner, dim=1)
-        
-        #concat channels
-        lstm_out = layer_output_s
-        #lstm_out = torch.cat((layer_output_s, layer_output_t), dim=2).permute(0,1,3,2)
+            output_inner = []
+            for t in range(seq_len):
+                # iterate through time
 
-#        for layer_idx in range(self.num_layers):
-#            h, c = hidden_state[layer_idx]
-#            output_inner = []
-#            for t in range(seq_len):
-#                h, c = self.cell_list[layer_idx](input_tensor=cur_layer_input[:, t, :, :],
-#                                                 cur_state=[h, c],
-#                                                 time=t)
-#                output_inner.append(h)
-#
-#            layer_output = torch.stack(output_inner, dim=1)
-#            cur_layer_input = layer_output
-#
-#            layer_output_list.append(layer_output)
-#            last_state_list.append([h, c])
+                # encoder [B, 11, S]
+                h_e, c_e = self.encoder[layer_idx](input_tensor=cur_layer_input[:, t, :, :],
+                                                 cur_state=[h_e, c_e])
+                # decoder  [B, 1, S]
+                h_d, c_d = self.decoder[layer_idx](input_tensor=c_e,
+                                                 cur_state=[h_d, c_d])
+
+                # attention
+                att_score = torch.tanh(self.attention_dec(c_d))
+
+                att = F.softmax(att_score, dim=1)
+
+                w_c_d = torch.mul(att, c_d)
+                w_h_d = torch.mul(att, h_d)
+                
+                c_d = torch.cat((c_d, w_c_d),axis=1)
+                h_d = torch.cat((h_d, w_h_d),axis=1)
+
+                output_inner.append(h_d)
+
+            layer_output = torch.stack(output_inner, dim=1)
+            cur_layer_input = layer_output
+
+            layer_output_list.append(layer_output)
+            last_state_list.append([h_d, c_d])
+
+        out = self.FC(layer_output_list[-1].view(B,T,-1))
+
+        out = torch.sigmoid(out)
+        return out
 
         if not self.return_all_layers:
             layer_output_list = layer_output_list[-1:]
             last_state_list = last_state_list[-1:]
-       
 
-#        if self.config =='ManyToOne':
-#            lstm_out = layer_output_list[-1].reshape(B,T,-1)
-#        else:
-#            lstm_out = layer_output_list[-1].permute(0,1,3,2)
-
+        lstm_out = layer_output_list[-1].reshape(B,T,-1)
         if self.static_features > 0:
             lstm_out = torch.cat((lstm_out, static_feat_tensor), 
                                  dim=-1)
 
         out = self.linear(lstm_out)
         out = torch.sigmoid(out)
-
+        
         return out#layer_output_list, last_state_list
 
-    def _init_hidden(self, batch_size, spatial_size):
+    def _init_hidden_encoder(self, batch_size, spatial_size):
         init_states = []
         for i in range(self.num_layers):
-            init_states.append(self.cell_list[i].init_hidden(batch_size, spatial_size))
+            init_states.append(self.encoder[i].init_hidden(batch_size, spatial_size))
         return init_states
+
+    def _init_hidden_decoder(self, batch_size, spatial_size):
+        init_states = []
+        for i in range(self.num_layers):
+            init_states.append(self.decoder[i].init_hidden(batch_size, spatial_size))
+        return init_states
+
 
     @staticmethod
     def _check_kernel_size_consistency(kernel_size):
